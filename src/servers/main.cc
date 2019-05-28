@@ -32,6 +32,10 @@
 #include <csignal>
 #include <mutex>
 
+#ifdef TRTIS_ENABLE_ASAN
+#include <sanitizer/lsan_interface.h>
+#endif  // TRTIS_ENABLE_ASAN
+
 #include "src/core/logging.h"
 #include "src/core/server.h"
 #include "src/core/status.h"
@@ -39,12 +43,6 @@
 #include "src/servers/http_server.h"
 
 namespace {
-
-// The inference server object. Once this server is successfully
-// created it does *not* transition back to a nullptr value and it is
-// *not* explicitly destructed. Thus we assume that 'server_' can
-// always be dereferenced.
-nvidia::inferenceserver::InferenceServer* server_ = nullptr;
 
 // Exit mutex and cv used to signal the main thread that it should
 // close the server and exit.
@@ -58,12 +56,6 @@ std::condition_variable exit_cv_;
 // exit if inference-server doesn't completely initialize (e.g. will
 // exit if even one model fails to load).
 bool exit_on_failed_init_ = true;
-
-// The HTTP, GRPC and metrics service/s
-std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>
-    http_services_;
-std::unique_ptr<nvidia::inferenceserver::GRPCServer> grpc_service_;
-std::unique_ptr<nvidia::inferenceserver::HTTPServer> metrics_service_;
 
 // The HTTP and GRPC ports. Initialized to default values and
 // modifyied based on command-line args. Set to -1 to indicate the
@@ -271,84 +263,94 @@ CheckPortCollision()
   return false;
 }
 
-std::unique_ptr<nvidia::inferenceserver::GRPCServer>
-StartGrpcService(nvidia::inferenceserver::InferenceServer* server)
+bool
+StartGrpcService(
+    const std::shared_ptr<nvidia::inferenceserver::InferenceServer>& server,
+    std::unique_ptr<nvidia::inferenceserver::GRPCServer>* grpc_service)
 {
-  std::unique_ptr<nvidia::inferenceserver::GRPCServer> service;
   nvidia::inferenceserver::Status status =
       nvidia::inferenceserver::GRPCServer::Create(
           server, grpc_port_, grpc_infer_thread_cnt_,
-          grpc_stream_infer_thread_cnt_, &service);
+          grpc_stream_infer_thread_cnt_, grpc_service);
   if (status.IsOk()) {
-    status = service->Start();
+    status = (*grpc_service)->Start();
   }
 
   if (!status.IsOk()) {
     LOG_ERROR << status.Message();
-    service.reset();
+    grpc_service->reset();
+    return false;
   }
 
-  return std::move(service);
-}
-
-nvidia::inferenceserver::Status
-StartHttpService(
-    nvidia::inferenceserver::InferenceServer* server,
-    const std::map<int32_t, std::vector<std::string>>& port_map)
-{
-  nvidia::inferenceserver::Status status =
-      nvidia::inferenceserver::HTTPServer::CreateAPIServer(
-          server, port_map, http_thread_cnt_, &http_services_);
-  if (status.IsOk()) {
-    for (auto& http_eps : http_services_) {
-      if (http_eps != nullptr) {
-        status = http_eps->Start();
-      }
-    }
-  }
-
-  if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
-    for (auto& http_eps : http_services_) {
-      if (http_eps != nullptr) {
-        http_eps.reset();
-      }
-    }
-  }
-
-  return status;
-}
-
-std::unique_ptr<nvidia::inferenceserver::HTTPServer>
-StartMetricsService()
-{
-  std::unique_ptr<nvidia::inferenceserver::HTTPServer> service;
-  nvidia::inferenceserver::Status status =
-      nvidia::inferenceserver::HTTPServer::CreateMetricsServer(
-          metrics_port_, 1 /* HTTP thread count */, allow_gpu_metrics_,
-          &service);
-  if (status.IsOk()) {
-    status = service->Start();
-  }
-  if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
-    service.reset();
-  }
-
-  return std::move(service);
+  return true;
 }
 
 bool
-StartEndpoints(nvidia::inferenceserver::InferenceServer* server)
+StartHttpService(
+    const std::shared_ptr<nvidia::inferenceserver::InferenceServer>& server,
+    const std::map<int32_t, std::vector<std::string>>& port_map,
+    std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>*
+        http_services)
 {
-  size_t i;
-  nvidia::inferenceserver::Status create_status;
+  nvidia::inferenceserver::Status status =
+      nvidia::inferenceserver::HTTPServer::CreateAPIServer(
+          server, port_map, http_thread_cnt_, http_services);
+  if (status.IsOk()) {
+    for (auto& http_eps : *http_services) {
+      if (http_eps != nullptr) {
+        status = http_eps->Start();
+        if (!status.IsOk()) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (!status.IsOk()) {
+    LOG_ERROR << status.Message();
+    for (auto& http_eps : *http_services) {
+      http_eps.reset();
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool
+StartMetricsService(
+    std::unique_ptr<nvidia::inferenceserver::HTTPServer>* metrics_service)
+{
+  nvidia::inferenceserver::Status status =
+      nvidia::inferenceserver::HTTPServer::CreateMetricsServer(
+          metrics_port_, 1 /* HTTP thread count */, allow_gpu_metrics_,
+          metrics_service);
+  if (status.IsOk()) {
+    status = (*metrics_service)->Start();
+  }
+
+  if (!status.IsOk()) {
+    LOG_ERROR << status.Message();
+    metrics_service->reset();
+    return false;
+  }
+
+  return true;
+}
+
+bool
+StartEndpoints(
+    const std::shared_ptr<nvidia::inferenceserver::InferenceServer>& server,
+    std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>*
+        http_services,
+    std::unique_ptr<nvidia::inferenceserver::GRPCServer>* grpc_service,
+    std::unique_ptr<nvidia::inferenceserver::HTTPServer>* metrics_service)
+{
   LOG_INFO << "Starting endpoints, '" << server->Id() << "' listening on";
 
   // Enable gRPC endpoints if requested...
   if (allow_grpc_ && (grpc_port_ != -1)) {
-    grpc_service_ = StartGrpcService(server);
-    if (grpc_service_ == nullptr) {
+    if (!StartGrpcService(server, grpc_service)) {
       LOG_ERROR << "Failed to start gRPC service";
       return false;
     }
@@ -359,14 +361,13 @@ StartEndpoints(nvidia::inferenceserver::InferenceServer* server)
     std::map<int32_t, std::vector<std::string>> port_map;
 
     // Group by port numbers
-    for (i = 0; i < http_ports_.size(); i++) {
+    for (size_t i = 0; i < http_ports_.size(); i++) {
       if (http_ports_[i] != -1) {
         port_map[http_ports_[i]].push_back(endpoint_names[i]);
       }
     }
 
-    create_status = StartHttpService(server, port_map);
-    if (!create_status.IsOk()) {
+    if (!StartHttpService(server, port_map, http_services)) {
       LOG_ERROR << "Failed to start HTTP service";
       return false;
     }
@@ -374,8 +375,7 @@ StartEndpoints(nvidia::inferenceserver::InferenceServer* server)
 
   // Enable metrics endpoint if requested...
   if (metrics_port_ != -1) {
-    metrics_service_ = StartMetricsService();
-    if (metrics_service_ == nullptr) {
+    if (!StartMetricsService(metrics_service)) {
       LOG_ERROR << "Failed to start Metrics service";
       return false;
     }
@@ -423,7 +423,9 @@ ParseFloatOption(const std::string arg)
 }
 
 bool
-Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
+Parse(
+    const std::shared_ptr<nvidia::inferenceserver::InferenceServer>& server,
+    int argc, char** argv)
 {
   std::string server_id(server->Id());
   std::string model_store_path(server->ModelStorePath());
@@ -613,24 +615,34 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
 int
 main(int argc, char** argv)
 {
+  bool start_status = false;
+  std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>
+      http_services;
+  std::unique_ptr<nvidia::inferenceserver::GRPCServer> grpc_service;
+  std::unique_ptr<nvidia::inferenceserver::HTTPServer> metrics_service;
+
   // Create the inference server
-  server_ = new nvidia::inferenceserver::InferenceServer();
+  std::shared_ptr<nvidia::inferenceserver::InferenceServer> server(
+      new nvidia::inferenceserver::InferenceServer());
 
   // Parse command-line using defaults provided by the inference
   // server. Update inference server options appropriately.
-  if (!Parse(server_, argc, argv)) {
-    exit(1);
+  if (!Parse(server, argc, argv)) {
+    goto exit;
   }
 
   // Start the HTTP, GRPC, and metrics endpoints.
-  if (!StartEndpoints(server_)) {
-    exit(1);
+  if (!StartEndpoints(
+          server, &http_services, &grpc_service, &metrics_service)) {
+    goto exit;
   }
 
   // Initialize the inference server
-  if (!server_->Init() && exit_on_failed_init_) {
-    exit(1);
+  if (!server->Init() && exit_on_failed_init_) {
+    goto exit;
   }
+
+  start_status = true;
 
   // Trap SIGINT and SIGTERM to allow server to exit gracefully
   signal(SIGINT, SignalHandler);
@@ -638,12 +650,12 @@ main(int argc, char** argv)
 
   // Wait until a signal terminates the server...
   while (!exiting_) {
-    uint32_t poll_secs = server_->RepositoryPollSeconds();
+    uint32_t poll_secs = server->RepositoryPollSeconds();
 
     // If enabled, poll the model repository to see if there have been
     // any changes.
     if (poll_secs > 0) {
-      nvidia::inferenceserver::Status status = server_->PollModelRepository();
+      nvidia::inferenceserver::Status status = server->PollModelRepository();
       if (!status.IsOk()) {
         LOG_ERROR << "Failed to poll model repository: " << status.Message();
       }
@@ -656,19 +668,28 @@ main(int argc, char** argv)
     exit_cv_.wait_for(lock, wait_timeout);
   }
 
-  bool stop_status = server_->Stop();
+exit:
+  bool stop_status = server->Stop();
 
-  if (grpc_service_) {
-    grpc_service_->Stop();
+  if (grpc_service != nullptr) {
+    grpc_service->Stop();
   }
-  for (auto& http_eps : http_services_) {
+  for (auto& http_eps : http_services) {
     if (http_eps != nullptr) {
       http_eps->Stop();
     }
   }
-  if (metrics_service_) {
-    metrics_service_->Stop();
+  if (metrics_service != nullptr) {
+    metrics_service->Stop();
   }
 
-  return (stop_status) ? 0 : 1;
+  LOG_INFO << "TensorRT Inference Server exiting...";
+
+#ifdef TRTIS_ENABLE_ASAN
+  // Can invoke ASAN before exit though this is typically not very
+  // useful since there are many objects that are not yet destructed.
+  //  __lsan_do_leak_check();
+#endif  // TRTIS_ENABLE_ASAN
+
+  return (start_status && stop_status) ? 0 : 1;
 }

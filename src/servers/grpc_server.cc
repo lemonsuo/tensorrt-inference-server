@@ -57,18 +57,19 @@ namespace {
 class AsyncResources : public nvrpc::Resources {
  public:
   explicit AsyncResources(
-      InferenceServer* server, int infer_threads, int mgmt_threads)
+      const std::shared_ptr<InferenceServer>& server, int infer_threads,
+      int mgmt_threads)
       : m_Server(server), m_MgmtThreadPool(mgmt_threads),
         m_InferThreadPool(infer_threads)
   {
   }
 
-  InferenceServer* GetServer() { return m_Server; }
+  const std::shared_ptr<InferenceServer>& GetServer() { return m_Server; }
   ThreadPool& GetMgmtThreadPool() { return m_MgmtThreadPool; }
   ThreadPool& GetInferThreadPool() { return m_InferThreadPool; }
 
  private:
-  InferenceServer* m_Server;
+  std::shared_ptr<InferenceServer> m_Server;
 
   // We can and should get specific on thread affinity.  It might not
   // be as important on the frontend, but the backend threadpool
@@ -105,13 +106,14 @@ template <class LifeCycle>
 class InferBaseContext : public BaseContext<LifeCycle, AsyncResources> {
   // Helper function that utilizes RETURN_IF_ERROR to avoid nested 'if'
   Status InferHelper(
-      InferenceServer* server, std::shared_ptr<ModelInferStats>& infer_stats,
+      const std::shared_ptr<InferenceServer>& server,
+      std::shared_ptr<ModelInferStats>& infer_stats,
       std::shared_ptr<ModelInferStats::ScopedTimer>& timer,
       InferRequest& request, InferResponse& response)
   {
     std::shared_ptr<InferenceServer::InferBackendHandle> backend = nullptr;
     RETURN_IF_ERROR(InferenceServer::InferBackendHandle::Create(
-        server, request.model_name(), request.model_version(), &backend));
+        server.get(), request.model_name(), request.model_version(), &backend));
     infer_stats->SetMetricReporter(
         backend->GetInferenceBackend()->MetricReporter());
 
@@ -253,8 +255,9 @@ GRPCServer::~GRPCServer()
 
 Status
 GRPCServer::Create(
-    InferenceServer* server, int32_t port, int infer_thread_cnt,
-    int stream_infer_thread_cnt, std::unique_ptr<GRPCServer>* grpc_server)
+    const std::shared_ptr<InferenceServer>& server, int32_t port,
+    int infer_thread_cnt, int stream_infer_thread_cnt,
+    std::unique_ptr<GRPCServer>* grpc_server)
 {
   g_Resources = std::make_shared<AsyncResources>(
       server, 1 /* infer threads */, 1 /* mgmt threads */);

@@ -169,8 +169,9 @@ HTTPMetricsServer::Handle(evhtp_request_t* req)
 class HTTPAPIServer : public HTTPServerImpl {
  public:
   explicit HTTPAPIServer(
-      InferenceServer* server, const std::vector<std::string>& endpoints,
-      const int32_t port, const int thread_cnt)
+      const std::shared_ptr<InferenceServer>& server,
+      const std::vector<std::string>& endpoints, const int32_t port,
+      const int thread_cnt)
       : HTTPServerImpl(port, thread_cnt), server_(server),
         endpoint_names_(endpoints),
         api_regex_(R"(/api/(health|profile|infer|status)(.*))"),
@@ -226,7 +227,7 @@ class HTTPAPIServer : public HTTPServerImpl {
   static void OKReplyCallback(evthr_t* thr, void* arg, void* shared);
   static void BADReplyCallback(evthr_t* thr, void* arg, void* shared);
 
-  InferenceServer* server_;
+  std::shared_ptr<InferenceServer> server_;
   std::vector<std::string> endpoint_names_;
 
   re2::RE2 api_regex_;
@@ -483,7 +484,7 @@ HTTPAPIServer::InferHelper(
 {
   std::shared_ptr<InferenceServer::InferBackendHandle> backend = nullptr;
   RETURN_IF_ERROR(InferenceServer::InferBackendHandle::Create(
-      server_, model_name, model_version, &backend));
+      server_.get(), model_name, model_version, &backend));
   infer_stats->SetMetricReporter(
       backend->GetInferenceBackend()->MetricReporter());
 
@@ -616,7 +617,7 @@ HTTPAPIServer::InferRequest::FinalizeResponse()
 
 Status
 HTTPServer::CreateAPIServer(
-    InferenceServer* server,
+    const std::shared_ptr<InferenceServer>& server,
     const std::map<int32_t, std::vector<std::string>>& port_map, int thread_cnt,
     std::vector<std::unique_ptr<HTTPServer>>* http_servers)
 {

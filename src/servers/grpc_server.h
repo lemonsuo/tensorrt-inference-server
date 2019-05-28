@@ -38,8 +38,9 @@ class ServerStatus;
 class GRPCServer : private nvrpc::Server {
  public:
   static Status Create(
-      InferenceServer* server, int32_t port, int infer_thread_cnt,
-      int stream_infer_thread_cnt, std::unique_ptr<GRPCServer>* grpc_servers);
+      const std::shared_ptr<InferenceServer>& server, int32_t port,
+      int infer_thread_cnt, int stream_infer_thread_cnt,
+      std::unique_ptr<GRPCServer>* grpc_servers);
   Status Start();
   Status Stop();
 
