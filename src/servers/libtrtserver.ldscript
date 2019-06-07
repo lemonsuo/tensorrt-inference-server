@@ -30,7 +30,6 @@
     *nvidia15inferenceserver10GRPCServer*;
     *nvidia15inferenceserver10HTTPServer*;
     *nvidia15inferenceserver15InferenceServer*;
-    *nvidia15inferenceserver15InferenceServer*;
     *nvidia15inferenceserver22ModelRepositoryManager*;
   local: *;
 };
